@@ -1,0 +1,35 @@
+#!/bin/sh
+# C++ compiler for x86_64-unknown-miniOS
+# Usage: x86_64-miniOS-c++ [flags] file... [-o output]
+
+SELF=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$SELF/../.." && pwd)
+SYSROOT="$ROOT/sysroot/usr/x86_64-miniOS"
+LDSCRIPT="$ROOT/targets/x86_64/userspace.ld"
+CLANG_BUILTINS=$(clang --target=x86_64-unknown-miniOS -print-file-name=include 2>/dev/null)
+
+LINK_MODE=1
+for arg in "$@"; do
+    case "$arg" in -c|-E|-S|-M|-MM) LINK_MODE=0; break ;; esac
+done
+
+BASE="--target=x86_64-unknown-miniOS \
+  -nostdinc \
+  -isystem $SYSROOT/include \
+  -isystem $CLANG_BUILTINS \
+  -D_DEFAULT_SOURCE \
+  -fPIC \
+  -mcmodel=small \
+  -mno-red-zone"
+
+if [ "$LINK_MODE" = "1" ]; then
+    exec clang++ $BASE \
+        -nostdlib -static -fuse-ld=lld \
+        -Wl,-S -Wl,-pie \
+        -Wl,-T"$LDSCRIPT" \
+        "$SYSROOT/lib/crt1.o" \
+        "$@" \
+        -L"$SYSROOT/lib" -lc++abi -lc
+else
+    exec clang++ $BASE "$@"
+fi

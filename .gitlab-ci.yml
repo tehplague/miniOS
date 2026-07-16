@@ -1,0 +1,38 @@
+stages:
+  - docs
+
+default:
+  tags:
+    - docker
+
+docs:
+  stage: docs
+  image: archlinux:latest
+  before_script:
+    - pacman -Syu --noconfirm
+    - pacman -S --noconfirm doxygen graphviz make openssh rsync git
+
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - cp "$SSH_KEY" ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - ssh-keyscan -t ed25519 -H s2.christian-spoo.info >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+
+    - make docs
+
+    - |
+      rsync -avz --delete \
+        -e "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no" \
+        docs/html/html/ \
+        website@s2.christian-spoo.info:/jails/website/site/docs/minios
+  after_script:
+    - rm -f ~/.ssh/id_ed25519
+  only:
+    - main
+    - master
+  environment:
+    name: production
+    url: https://www.christian-spoo.de/docs/minios/

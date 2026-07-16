@@ -1,0 +1,15 @@
+megs: 32
+romimage: file=/usr/share/bochs/BIOS-bochs-legacy
+vgaromimage: file=/usr/share/bochs/VGABIOS-lgpl-latest
+boot: cdrom
+ata0: enabled=true, ioaddr1=0x1f0, ioaddr2=0x3f0, irq=14
+ata0-master: type=cdrom, path="dist/x86_64/kernel.iso", status=inserted, model="Generic 1234", biosdetect=auto
+ata0-slave: type=none
+cpu: model=tigerlake, ips=1000000, reset_on_triple_fault=0
+
+mouse: enabled=0
+
+keyboard: type=mf, serial_delay=200, paste_delay=100000
+keyboard: keymap=/usr/share/bochs/keymaps/sdl2-pc-de.map
+
+display_library: sdl2

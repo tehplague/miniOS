@@ -1,0 +1,4 @@
+testfs/**
+!testfs/bin/.gitkeep
+!testfs/etc/
+!testfs/etc/**
