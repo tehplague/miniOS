@@ -27,7 +27,7 @@ docs:
       rsync -avz --delete \
         -e "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no" \
         docs/html/html/ \
-        website@s2.christian-spoo.info:/jails/website/site/docs/minios
+        website@s2.christian-spoo.info:/usr/local/www/app/docs/minios
   after_script:
     - rm -f ~/.ssh/id_ed25519
   only:
