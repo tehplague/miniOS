@@ -252,18 +252,32 @@ sched_kick_wrapper:
     iretq
 
 ; -----------------------------------------------------------------------
-; TLB-shootdown IPI wrapper — calls tlb_shootdown_isr(frame_ptr)
-; invlpg + barrier decrement + EOI are all inside tlb_shootdown_isr().
+; TLB-shootdown IPI wrappers — one per possible initiator CPU (0..7, must
+; match MAX_CPUS's default of 8; see TLB_SHOOTDOWN_VECTOR_BASE in apic.h).
+; Each calls tlb_shootdown_isr(src_cpu) with its own baked-in CPU index so
+; the handler knows which g_tlb_barriers[] slot to service — invlpg,
+; barrier decrement, and EOI are all inside tlb_shootdown_isr().
 ; -----------------------------------------------------------------------
-global tlb_shootdown_wrapper
 extern tlb_shootdown_isr
 
-tlb_shootdown_wrapper:
+%macro TLB_SHOOTDOWN_WRAPPER 1
+global tlb_shootdown_wrapper%1
+tlb_shootdown_wrapper%1:
     save_context
-    lea  rdi, [rsp]         ; frame pointer as first arg
+    mov  edi, %1            ; src_cpu as first arg
     call tlb_shootdown_isr
     restore_context
     iretq
+%endmacro
+
+TLB_SHOOTDOWN_WRAPPER 0
+TLB_SHOOTDOWN_WRAPPER 1
+TLB_SHOOTDOWN_WRAPPER 2
+TLB_SHOOTDOWN_WRAPPER 3
+TLB_SHOOTDOWN_WRAPPER 4
+TLB_SHOOTDOWN_WRAPPER 5
+TLB_SHOOTDOWN_WRAPPER 6
+TLB_SHOOTDOWN_WRAPPER 7
 
 ; -----------------------------------------------------------------------
 ; Panic-halt IPI wrapper — calls panic_halt_isr(frame_ptr)

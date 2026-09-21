@@ -118,6 +118,10 @@ typedef struct vfs_ops {
     /* Fill filesystem statistics; returns 0 on success, -1 on error.
      * NULL if the filesystem does not expose usage statistics. */
     int (*statfs)(vfs_statfs_t *out);
+    /* Release any single-instance global state held by this filesystem so it
+     * can be mounted again. Called by vfs_unregister_mount(). NULL if the
+     * filesystem has no such state to release (e.g. tmpfs, sysfs). */
+    void (*unmount)(void);
 } vfs_ops_t;
 
 /* Filesystem type registry — maps fstype names to mount callbacks */
@@ -172,6 +176,15 @@ typedef struct vfs_mount {
  * @return: 0 on success, -1 if mount table is full.
  */
 int vfs_register_mount(const char *point, vfs_ops_t *ops, uint32_t root_ino);
+
+/**
+ * vfs_unregister_mount() - Remove a mount table entry by exact mount point match.
+ * Calls ops->unmount() (if set) before removing, so single-instance filesystems
+ * (e.g. ext2) can release their global state and allow being mounted again.
+ * @point: Exact mount point path as passed to vfs_register_mount() (e.g. "/tmp").
+ * @return: 0 on success, -1 if no mount is registered at @point.
+ */
+int vfs_unregister_mount(const char *point);
 
 int vfs_mount_count(void);
 const vfs_mount_t *vfs_get_mount(int idx);

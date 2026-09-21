@@ -41,3 +41,23 @@ uint64_t vmm_virt_to_phys(uint64_t virt) {
     (void)virt;
     return 0;
 }
+
+int vmm_map_page_in(uint64_t pml4_phys, uint64_t virt, uint64_t phys, uint64_t flags) {
+    (void)pml4_phys;
+    (void)virt;
+    (void)phys;
+    (void)flags;
+    return 0;
+}
+
+uint64_t vmm_virt_to_phys_in(uint64_t pml4_phys, uint64_t virt) {
+    (void)pml4_phys;
+    (void)virt;
+    return 0;
+}
+
+uint64_t vmm_virt_to_pte_in(uint64_t pml4_phys, uint64_t virt) {
+    (void)pml4_phys;
+    (void)virt;
+    return 0;
+}

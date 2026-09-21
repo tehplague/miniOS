@@ -216,6 +216,24 @@ static void page_fault_exception(struct task_cpu_context *context) {
 
     /* Bit 2 of error_code is the U/S bit: 1 = fault came from user mode. */
     if (error_code & 0x04) {
+        /* #PF is an interrupt gate, so IF stays 0 for the whole handler —
+         * deliberately NOT re-enabled here. vmm_resolve_user_fault() can
+         * call ipi_tlb_shootdown() (CoW copy, lazy brk/mmap), which is safe
+         * to call with IF=0 (each CPU only ever initiates from its own
+         * g_tlb_barriers[] slot — see ipi.h). The only cost of staying
+         * IF=0 is that a peer CPU's shootdown targeting THIS CPU has to
+         * wait for this handler to finish and return (bounded — this
+         * handler does a fixed amount of work and never blocks). An
+         * earlier attempt to `sti` here to shrink that wait exposed a far
+         * worse problem: the exception-return path (iretq via the
+         * exception wrapper's own frame) is not proven safe against a
+         * nested preemption/context-switch happening while still inside
+         * exception context — enabling interrupts here let a LAPIC timer
+         * tick preempt mid-handler and corrupt kernel .text mappings on
+         * resume (instruction-fetch #PFs on tlb_shootdown_isr and this
+         * function itself, cascading into a CPU reset under SMP). Keep
+         * IF=0 until that path is actually audited. */
+
         /* Try to resolve via demand paging (lazy anonymous mmap). */
         if (vmm_resolve_user_fault(cr2, error_code) == 0)
             return;  /* resolved — iretq resumes the faulting instruction */

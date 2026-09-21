@@ -374,17 +374,33 @@ bool sched_has_user_threads(void);
 
 /**
  * sched_fork() - Fork the current user task.
+ * @child_rdi: Value to restore into the child's RDI before it returns to
+ *             userspace (fork_child_trampoline reads it from
+ *             child->saved_user_rdi) — the raw syscall arg1, which for a
+ *             fork(2) call is whatever the caller's libc left in RDI across
+ *             the syscall instruction (e.g. mlibc's internal fork() sysdep
+ *             uses it to stash a scratch pointer it writes through after
+ *             the syscall returns).
  *
  * Allocates a new thread and copies all USER_STACK_PAGES physical frames
  * from the parent's user stack (walking page tables via vmm_virt_to_phys
  * to handle non-contiguous PMM allocations). The parent returns the child's
  * thread pointer; the child is wired to return 0 via fork_child_trampoline.
  *
- * Context: Called from the SYS_fork syscall handler. Panics on OOM.
+ * IMPORTANT: @child_rdi must be set on the child BEFORE it is marked
+ * THREAD_RUNNABLE, not by the caller afterward — under SMP, a remote CPU can
+ * dequeue and start running the child (via a scheduler-kick IPI) before the
+ * fork() syscall handler's own C code resumes on the parent's CPU, so any
+ * post-hoc `child->saved_user_rdi = arg1` after sched_fork() returns races
+ * the child's own fork_child_trampoline reading that same field and reliably
+ * loses under real multi-CPU timing (the child observes 0, not @child_rdi).
+ *
+ * Context: Called from the SYS_fork / SYS_clone (no-CLONE_VM fallback)
+ * syscall handlers. Panics on OOM.
  * @return: Pointer to the child thread (for the parent); child takes the
  *          fork_child_trampoline path and never returns through this function.
  */
-struct thread *sched_fork(void);
+struct thread *sched_fork(uint64_t child_rdi);
 
 /**
  * sched_wait() - Block until a child thread exits.

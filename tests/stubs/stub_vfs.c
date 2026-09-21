@@ -138,6 +138,12 @@ int vfs_register_mount(const char *point, vfs_ops_t *ops, uint32_t root_ino) {
     return 0;
 }
 
+/* vfs_unregister_mount: always succeeds */
+int vfs_unregister_mount(const char *point) {
+    (void)point;
+    return 0;
+}
+
 /* vfs_lstat: same as vfs_stat for stub purposes — no symlinks in stub world */
 int vfs_lstat(const char *path, vfs_inode_info_t *out) {
     if (path && out) {

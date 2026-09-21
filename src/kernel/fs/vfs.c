@@ -193,6 +193,30 @@ int vfs_register_mount(const char *point, vfs_ops_t *ops, uint32_t root_ino) {
 }
 
 /**
+ * vfs_unregister_mount() - Remove a mount table entry by exact mount point match.
+ * @point: Exact mount point path as passed to vfs_register_mount().
+ *
+ * Calls ops->unmount() (if set) before removing the entry, then compacts
+ * g_mounts[] so later slots shift down.
+ * @return: 0 on success, -1 if no mount is registered at @point.
+ */
+int vfs_unregister_mount(const char *point) {
+    if (!point) return -1;
+    for (int i = 0; i < g_num_mounts; i++) {
+        if (strncmp(g_mounts[i].mount_point, point, VFS_PATH_MAX) == 0) {
+            if (g_mounts[i].ops && g_mounts[i].ops->unmount)
+                g_mounts[i].ops->unmount();
+            for (int j = i; j < g_num_mounts - 1; j++)
+                g_mounts[j] = g_mounts[j + 1];
+            g_num_mounts--;
+            printk("VFS: unmounted %s\n", point);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/**
  * vfs_mount() - Store the filesystem ops table at root "/" (backwards-compat shim).
  * @ops: Pointer to filesystem ops (must have lookup, read, readdir set).
  *

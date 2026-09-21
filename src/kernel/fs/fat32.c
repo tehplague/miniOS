@@ -417,32 +417,44 @@ static int fat32_statfs(vfs_statfs_t *out)
     return 0;
 }
 
+/* fat32 keeps a single global instance (g_part_start/g_bytes_per_sector/etc.
+ * above), so only one fat32 mount may be active at a time — same constraint
+ * as ext2. */
+static int g_fat32_mounted = 0;
+
+static void fat32_do_unmount(void) {
+    g_fat32_mounted = 0;
+}
+
 static vfs_ops_t g_fat32_ops = {
     .lookup  = fat32_lookup,
     .read    = fat32_read,
     .readdir = fat32_readdir,
     .statfs  = fat32_statfs,
+    .unmount = fat32_do_unmount,
 };
 
+/* Validates the BPB using a local buffer before touching any global state,
+ * so a failed call never corrupts an already-mounted instance (see the
+ * matching fix in ext2_mount()). */
 int fat32_mount(uint64_t part_lba_start, uint64_t part_lba_end)
 {
-    g_part_start = part_lba_start;
-    g_part_end   = part_lba_end;
+    uint8_t local_buf[512];
 
     /* Read BPB from sector 0 of the partition. */
-    if (block_read(part_lba_start, 1, g_fat_buf) != 0) {
+    if (block_read(part_lba_start, 1, local_buf) != 0) {
         printk("FAT32: failed to read BPB\n");
         return -1;
     }
 
-    fat32_bpb_t *bpb = (fat32_bpb_t *)g_fat_buf;
+    fat32_bpb_t *bpb = (fat32_bpb_t *)local_buf;
     fat32_ebr_t *ebr = &bpb->ebr;
 
-    g_bytes_per_sector   = bpb->bytes_per_sector;
-    g_sectors_per_cluster = bpb->sectors_per_cluster;
+    uint32_t bytes_per_sector   = bpb->bytes_per_sector;
+    uint32_t sectors_per_cluster = bpb->sectors_per_cluster;
 
-    if (g_bytes_per_sector != 512) {
-        printk("FAT32: unsupported sector size %u\n", g_bytes_per_sector);
+    if (bytes_per_sector != 512) {
+        printk("FAT32: unsupported sector size %u\n", bytes_per_sector);
         return -1;
     }
 
@@ -451,11 +463,16 @@ int fat32_mount(uint64_t part_lba_start, uint64_t part_lba_end)
     uint32_t root_dir_sectors = ((uint32_t)bpb->root_entry_count * 32
         + bpb->bytes_per_sector - 1) / bpb->bytes_per_sector;
 
-    g_fat_start_sector  = bpb->reserved_sector_count;
-    g_first_data_sector = bpb->reserved_sector_count
+    /* Validated — safe to commit to global state. */
+    g_part_start          = part_lba_start;
+    g_part_end            = part_lba_end;
+    g_bytes_per_sector    = bytes_per_sector;
+    g_sectors_per_cluster = sectors_per_cluster;
+    g_fat_start_sector    = bpb->reserved_sector_count;
+    g_first_data_sector   = bpb->reserved_sector_count
                           + (uint32_t)bpb->fat_count * sectors_per_fat
                           + root_dir_sectors;
-    g_root_cluster      = ebr->root_directory_cluster;
+    g_root_cluster        = ebr->root_directory_cluster;
 
     printk("FAT32: mounted — cluster=%u B, root_cluster=%u, first_data=%u\n",
            g_sectors_per_cluster * g_bytes_per_sector,
@@ -466,6 +483,11 @@ int fat32_mount(uint64_t part_lba_start, uint64_t part_lba_end)
 static int fat32_fs_mount(const char *source, const char *target, const void *data)
 {
     (void)source;
+    if (g_fat32_mounted) {
+        printk("FAT32: already mounted elsewhere (single-instance filesystem); "
+               "unmount it first\n");
+        return -16;  /* EBUSY */
+    }
     if (!data) {
         printk("FAT32: mount called without vfs_mount_data_t\n");
         return -22;
@@ -478,7 +500,9 @@ static int fat32_fs_mount(const char *source, const char *target, const void *da
     }
     if (fat32_mount(blkdev->lba_start, blkdev->lba_end) != 0)
         return -1;
-    return vfs_register_mount(target, &g_fat32_ops, 0);
+    int rc = vfs_register_mount(target, &g_fat32_ops, 0);
+    if (rc == 0) g_fat32_mounted = 1;
+    return rc;
 }
 
 void fat32_init(void)

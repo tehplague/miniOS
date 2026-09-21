@@ -71,12 +71,32 @@ known limitation (no true concurrent process execution).
 
 ### Process exit and exec
 
-`sched_exit_current()` calls `vmm_free_address_space(pml4_phys)` once (for a
+`sched_exit_current()` tears down a process's address space once (for a
 single-threaded process) or when the last member of a `thread_group_t` exits (shared
-address space). That walks the process's own low half, `pmm_unref_frame()`-ing every
-mapped page — private pages are freed, still-shared CoW pages are just decremented,
-leaving any sibling process's reference intact — then frees the intermediate
-PDPT/PD/PT frames and the PML4 itself.
+address space) — but under SMP it must not call `vmm_free_address_space(pml4_phys)`
+directly: that PML4 is still this CPU's own live `CR3` at this point (the actual
+switch-away happens later, inside the `sched_schedule()` call at the end of this same
+function). Freeing it here would return its physical frames — the PML4 itself and
+every PDPT/PD/PT frame beneath it — to the pool while this CPU is still translating
+every memory access through them; another CPU's concurrent `pmm_alloc_frame()` can
+then hand one of those frames to `vmm_new_address_space()`, whose `memset()` zeroes it
+for a completely unrelated new process, corrupting this CPU's live page tables (most
+visibly the shared kernel-half mapping) out from under it — a real, non-hypothetical
+SMP triple-fault chased down live via GDB against the QEMU stub (kernel `.text` pages
+becoming instruction-fetch-not-present on the CPU that hadn't switched CR3 away yet).
+
+Instead, `sched_exit_current()` stashes the doomed PML4 in
+`cpu_local()->pending_free_pml4` (`include/miniOS/arch/x86_64/smp.h`), and
+`sched_schedule()` frees it — via `vmm_free_address_space()` — right after confirming
+this CPU's `CR3` has actually moved off of it. If the next thread scheduled is idle
+(`pml4_phys==0`, CR3 deliberately left untouched — see below), the free is correctly
+deferred to whichever later call first changes this CPU's CR3 away from the pending
+PML4, rather than freed while it's still live.
+
+`vmm_free_address_space()` itself walks the process's own low half,
+`pmm_unref_frame()`-ing every mapped page — private pages are freed, still-shared CoW
+pages are just decremented, leaving any sibling process's reference intact — then
+frees the intermediate PDPT/PD/PT frames and the PML4 itself.
 
 `sys_execve()` no longer special-cases "is this a fork child" at all: it just tears
 down (`pmm_unref_frame()`) and rebuilds *this process's own* PML4, since CoW-shared

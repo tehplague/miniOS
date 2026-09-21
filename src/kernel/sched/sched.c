@@ -439,6 +439,21 @@ static void sched_schedule(void)
     next->state = THREAD_RUNNING;
     cpu->current_thread = next;
 
+    /* From here through context_switch_asm(), CR3 gets switched to `next`'s
+     * address space several instructions before context_switch_asm() actually
+     * moves execution (and RSP) onto `next`'s stack — a window where CR3
+     * (new) and the live RSP (still `old`'s) are mismatched. Every current
+     * caller of sched_schedule() already runs with IF=0 (interrupt-gate ISR,
+     * or explicit cli/spinlock_irqsave around the call), so in principle no
+     * interrupt can land in that window — but that invariant lives entirely
+     * in caller discipline, is easy for a future caller to get wrong, and a
+     * nested interrupt landing here would push its frame at the CURRENT
+     * (old) RSP while CR3 already points at `next`'s page tables, which can
+     * fault if that stack page isn't resolvable there. Guarantee IF=0 for
+     * this section directly instead of trusting every call site. */
+    unsigned long sched_flags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(sched_flags) :: "memory");
+
     /* Update this CPU's TSS RSP0 and cpu_t.kstack_top to the top of the next
      * thread's kernel stack.  per_cpu_update_rsp0() writes both atomically:
      * - percpu_tss[cpu_id].privileged_stack_table[0]: used by hardware on
@@ -464,16 +479,46 @@ static void sched_schedule(void)
             __asm__ volatile("mov %0, %%cr3" :: "r"(next_pml4) : "memory");
     }
 
+    /* Free a previously-exited thread's address space now that this CPU's
+     * CR3 is confirmed to no longer be it — see pending_free_pml4's doc
+     * comment in smp.h. If `next` is an idle thread (next_pml4==0, CR3left
+     * untouched above) and CR3 still equals the pending PML4, this correctly
+     * defers to a later call — whenever this CPU's CR3 actually next changes
+     * away from it — rather than freeing frames still live in CR3. */
+    if (cpu->pending_free_pml4 != 0) {
+        uint64_t live_cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(live_cr3));
+        if (live_cr3 != cpu->pending_free_pml4) {
+            vmm_free_address_space(cpu->pending_free_pml4);
+            cpu->pending_free_pml4 = 0;
+        }
+    }
+
+    /* Restored on THIS thread's own stack once it is scheduled back in —
+     * context_switch_asm() below only "returns" here on resumption, at
+     * which point popping the flags this same thread pushed above correctly
+     * restores whatever IF was before this function was entered. */
     context_switch_asm(&old->ctx, &next->ctx);
+    __asm__ volatile("push %0; popfq" :: "r"(sched_flags) : "memory");
 }
 
 /**
  * sched_tick() - LAPIC timer ISR callback; advance the scheduler.
  *
- * Increments the global tick counter. Calls sched_schedule() to perform a
- * context switch when the current thread's quantum expires (or immediately
- * when a higher-priority thread becomes runnable). EOI is sent by the LAPIC
- * timer ISR before calling this function; the context switch is safe.
+ * Calls sched_schedule() to perform a context switch when the current
+ * thread's quantum expires (or immediately when a higher-priority thread
+ * becomes runnable). EOI is sent by the LAPIC timer ISR before calling this
+ * function; the context switch is safe.
+ *
+ * Only the BSP (cpu_id 0) advances sched_tick_count and scans ITIMER_REAL
+ * deadlines — every CPU's LAPIC timer is independently calibrated to the
+ * same ~100Hz (confirmed at boot: "AP CPU N: LAPIC timer started, ICR=...
+ * (~100 Hz)"), so if every CPU incremented the same global counter it would
+ * advance N times faster than real time under N-CPU SMP, making any
+ * ITIMER_REAL-derived deadline (alarm(2)/setitimer(2) — e.g. busybox ping's
+ * -i interval pacing) fire N times too fast. The BSP's own tick alone is a
+ * correct ~100Hz wall-clock source regardless of core count; every other CPU
+ * still runs its own local preemption decision below unconditionally.
  *
  * Context: Must only be called from the LAPIC timer ISR with interrupts
  *          disabled via the interrupt gate mechanism. Must not allocate.
@@ -486,25 +531,28 @@ void sched_tick(void)
        the per-CPU run queue.  run_queue_head == NULL means sched_next() would
        dereference a null pointer (do-while loop on t->state with t=NULL). */
     if (cpu->run_queue_head == NULL) return;
-    sched_tick_count++;
     cpu->current_thread->utime_ticks++;
 
-    /* Check ITIMER_REAL expiry for all armed threads.
-     * We scan all threads each tick — acceptable overhead for small thread counts. */
-    for (int _i = 1; _i < SCHED_MAX_THREADS; _i++) {
-        struct thread *_t = &thread_pool[_i];
-        if (_t->itimer_real_active &&
-            _t->itimer_real_deadline_ticks != 0 &&
-            sched_tick_count >= _t->itimer_real_deadline_ticks) {
-            /* Fire SIGALRM */
-            sched_signal_thread(_t, SIGALRM);
-            /* Reload interval or disarm */
-            if (_t->itimer_real_interval_ticks != 0) {
-                _t->itimer_real_deadline_ticks = sched_tick_count +
-                                                 _t->itimer_real_interval_ticks;
-            } else {
-                _t->itimer_real_active = 0;
-                _t->itimer_real_deadline_ticks = 0;
+    if (cpu->cpu_id == 0) {
+        sched_tick_count++;
+
+        /* Check ITIMER_REAL expiry for all armed threads.
+         * We scan all threads each tick — acceptable overhead for small thread counts. */
+        for (int _i = 1; _i < SCHED_MAX_THREADS; _i++) {
+            struct thread *_t = &thread_pool[_i];
+            if (_t->itimer_real_active &&
+                _t->itimer_real_deadline_ticks != 0 &&
+                sched_tick_count >= _t->itimer_real_deadline_ticks) {
+                /* Fire SIGALRM */
+                sched_signal_thread(_t, SIGALRM);
+                /* Reload interval or disarm */
+                if (_t->itimer_real_interval_ticks != 0) {
+                    _t->itimer_real_deadline_ticks = sched_tick_count +
+                                                     _t->itimer_real_interval_ticks;
+                } else {
+                    _t->itimer_real_active = 0;
+                    _t->itimer_real_deadline_ticks = 0;
+                }
             }
         }
     }
@@ -746,12 +794,16 @@ void sched_exit_current(int code)
         }
         spinlock_irqrestore(&cur->tg->lock, tg_flags);
         cur->tg = NULL;
+        /* Deferred to cpu_local()->pending_free_pml4 (freed by sched_schedule()
+         * right after this CPU's CR3 moves off of it) — see the field's doc
+         * comment in smp.h for why: this PML4 is still cur's — and thus this
+         * CPU's — live CR3 right now. */
         if (last_member)
-            vmm_free_address_space(tg_pml4);
+            cpu_local()->pending_free_pml4 = tg_pml4;
     } else if (cur->pml4_phys) {
         /* Single-threaded process: this thread solely owns its address
          * space (stack, code/data/BSS/heap, mmap regions — all of it). */
-        vmm_free_address_space(cur->pml4_phys);
+        cpu_local()->pending_free_pml4 = cur->pml4_phys;
         cur->pml4_phys = 0;
     }
 
@@ -847,7 +899,7 @@ static void fork_cow_share_page(struct thread *child, uint64_t virt)
     pmm_ref_frame(phys);
 }
 
-struct thread *sched_fork(void) {
+struct thread *sched_fork(uint64_t child_rdi) {
     struct thread *parent = sched_current();
 
     /* sched_create_user_task() gives the child its own address space
@@ -957,6 +1009,11 @@ struct thread *sched_fork(void) {
     for (int i = 0; i < 32; i++) {
         child->signal_actions[i] = parent->signal_actions[i];
     }
+
+    /* Must be set before THREAD_RUNNABLE below — see the @child_rdi doc
+     * comment in sched.h for why a remote CPU can otherwise start running
+     * the child (reading this same field) before this assignment happens. */
+    child->saved_user_rdi = child_rdi;
 
     /* Parent and child now have independent address spaces (including
      * independent stacks), so there's no shared-VA hazard between fork()

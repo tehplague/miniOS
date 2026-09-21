@@ -818,6 +818,12 @@ int64_t syscall_dispatch_fs(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_t 
         const char *target = (const char *)arg1;
         if (!target)
             return -22;
+        if ((uint64_t)target >= KERNEL_VMA)
+            return -14;
+        if (strncmp(target, "/", 2) == 0)
+            return -16;  /* EBUSY: refuse to unmount the root filesystem */
+        if (vfs_unregister_mount(target) < 0)
+            return -22;  /* EINVAL: not a mount point */
         return 0;
     }
 

@@ -80,6 +80,17 @@ typedef struct cpu_t {
     struct thread  *current_thread;  /* thread currently running on this CPU — gs:56 */
     uint64_t        kstack_top;      /* per-CPU kernel stack top for SYSCALL/TSS RSP0 — gs:64 */
     uint64_t        user_rsp_scratch;/* per-CPU scratch: user RSP at SYSCALL entry — gs:72 */
+    /* PML4 physical address of an exited thread's address space, freed by
+     * sched_schedule() right after THIS CPU's own CR3 has moved off of it —
+     * never by sched_exit_current() itself, which runs with that same PML4
+     * still loaded in CR3. Freeing it there would return its physical frames
+     * (PML4 itself and everything beneath it) to the pool while this CPU is
+     * still translating every memory access through them; another CPU's
+     * concurrent pmm_alloc_frame() can then hand one of those frames out and
+     * zero/overwrite it (e.g. vmm_new_address_space()'s memset for a new,
+     * unrelated process), corrupting this CPU's live page tables out from
+     * under it. 0 = nothing pending. */
+    uint64_t        pending_free_pml4;
 } cpu_t;
 
 /* Global array of cpu_t, indexed 0..smp_cpu_count-1.

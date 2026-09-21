@@ -185,8 +185,15 @@ void ioapic_unmask_irq(uint8_t irq);
 #define LAPIC_TIMER_MASKED      (1 << 16)   /* LVT: mask the timer      */
 #define LAPIC_TIMER_VECTOR      48          /* IDT vector for LAPIC timer */
 #define SCHEDULER_KICK_VECTOR   50          /* IDT vector: scheduler-kick IPI from remote CPU */
-#define TLB_SHOOTDOWN_VECTOR    51          /* IDT vector: TLB-shootdown IPI broadcast */
 #define PANIC_HALT_VECTOR       52          /* IDT vector: panic-halt IPI broadcast */
+/* IDT vectors 53..53+MAX_CPUS-1: one dedicated TLB-shootdown IPI vector per
+ * possible INITIATOR CPU (hardcoded to 8 — must match MAX_CPUS's default in
+ * smp.h; there is no build-system plumbing to pass MAX_CPUS into the NASM
+ * assembler). Giving each initiator its own vector (and barrier slot, see
+ * ipi.h) means concurrent shootdowns started by different CPUs never share
+ * mutable state — see ipi.c for why a single shared vector/barrier isn't
+ * safe under SMP. */
+#define TLB_SHOOTDOWN_VECTOR_BASE 53
 #define LAPIC_TIMER_DIVBY_16    0x3         /* DCR divide-by-16         */
 
 /**

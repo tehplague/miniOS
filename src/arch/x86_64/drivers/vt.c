@@ -838,10 +838,11 @@ void vt_init_gop(uint64_t fb_virt, uint32_t width, uint32_t height,
 }
 
 /* Called from the LAPIC timer ISR (100 Hz) on the BSP only.
- * Toggles cursor blink every 10 ticks (100 ms). */
+ * Toggles cursor blink every 50 ticks (500 ms) — matches the standard BIOS/
+ * VGA text-console blink rate (visible/hidden ~500ms each, ~1s full cycle). */
 void vt_cursor_tick(void) {
     if (!g_fb_virt || !vt_state.cursor_visible) return;
-    if (++gop_cursor_tick_ctr < 10) return;
+    if (++gop_cursor_tick_ctr < 50) return;
     gop_cursor_tick_ctr = 0;
     gop_cursor_blink_on = !gop_cursor_blink_on;
     unsigned long flags;

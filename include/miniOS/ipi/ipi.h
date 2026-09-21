@@ -26,8 +26,9 @@
  * @brief TLB shootdown and panic-halt IPI infrastructure.
  *
  * Implements two IPI paths:
- * - TLB shootdown (vector 51): vmm_unmap_page() calls ipi_tlb_shootdown() to
- *   ensure all CPUs flush the invalidated mapping before the caller continues.
+ * - TLB shootdown (vectors TLB_SHOOTDOWN_VECTOR_BASE..+MAX_CPUS-1):
+ *   vmm_unmap_page() / vmm_map_page() call ipi_tlb_shootdown() to ensure all
+ *   CPUs flush the invalidated mapping before the caller continues.
  * - Panic halt (vector 52): kernel_panic() calls ipi_panic_halt() to halt all
  *   APs before the BSP prints the panic message and halts.
  * @{
@@ -38,6 +39,7 @@
 
 #include <miniOS/types.h>
 #include <miniOS/arch/x86_64/spinlock.h>
+#include <miniOS/arch/x86_64/smp.h>
 
 /**
  * ipi_barrier_t - Synchronous completion barrier for broadcast IPIs.
@@ -52,8 +54,17 @@ typedef struct {
     uint64_t          virt;       /* virtual address for TLB shootdown */
 } ipi_barrier_t;
 
-/* Global TLB shootdown barrier — shared between initiator and all ISR handlers */
-extern ipi_barrier_t g_tlb_barrier;
+/* One TLB-shootdown barrier PER INITIATOR CPU, indexed by the initiating
+ * CPU's cpu_id. A shootdown started by CPU N always uses g_tlb_barriers[N]
+ * and is announced on the dedicated vector TLB_SHOOTDOWN_VECTOR_BASE + N
+ * (see tlb_shootdown_isr_n() in ipi.c). This means two CPUs initiating a
+ * shootdown at the same time never touch the same barrier struct — no lock
+ * needed, and no risk of one initiator's ack_count/virt being clobbered by
+ * another's concurrent call — with a single shared barrier, two concurrent
+ * initiators can flush the wrong address on remote CPUs and drive ack_count
+ * below zero (wraps, since it's unsigned), making ipi_barrier_wait() spin
+ * forever. */
+extern ipi_barrier_t g_tlb_barriers[MAX_CPUS];
 
 /**
  * @brief Atomically decrement the barrier's ack_count.
@@ -76,24 +87,35 @@ static inline void ipi_barrier_wait(ipi_barrier_t *b) {
  * @brief Broadcast TLB-shootdown IPI and wait for all CPUs to flush.
  * @param virt Virtual address to invalidate on all CPUs.
  *
- * Sets g_tlb_barrier.virt = @virt and g_tlb_barrier.ack_count = smp_cpu_count - 1,
- * then broadcasts TLB_SHOOTDOWN_VECTOR (51) to all CPUs except self via
+ * Uses g_tlb_barriers[cpu_local()->cpu_id] — the calling CPU's own slot, so
+ * this is safe to call concurrently from multiple CPUs with no lock. Sets
+ * that barrier's virt = @virt and ack_count = smp_cpu_count - 1, then
+ * broadcasts TLB_SHOOTDOWN_VECTOR_BASE + cpu_id to all CPUs except self via
  * lapic_send_ipi. Spins in ipi_barrier_wait() until all handlers have called
  * ipi_barrier_ack(). Caller (sys_munmap) must have already called invlpg locally.
  *
- * Context: Called with interrupts disabled or spinlock protection on g_tlb_barrier.
+ * Context: Safe to call with interrupts disabled (e.g. from a page-fault
+ * handler resolving CoW — page_fault_exception() deliberately does NOT
+ * `sti` for this reason, unlike the SYSCALL entry path). Each CPU only ever
+ * initiates from its own barrier slot, so the initiator needs no lock and
+ * no incoming interrupts to make progress. A CPU that is itself the TARGET
+ * of a concurrent shootdown while its own interrupts are disabled just
+ * delays that peer's wait until this CPU's current IF=0 section finishes
+ * and returns (bounded, since none of these sections block) — no deadlock.
  */
 void ipi_tlb_shootdown(uint64_t virt);
 
 /**
- * @brief ISR for TLB_SHOOTDOWN_VECTOR (51) on remote CPUs.
- * @param frame Pointer to the interrupt frame (unused by this handler).
+ * @brief ISR for TLB_SHOOTDOWN_VECTOR_BASE + N on remote CPUs (one per
+ * possible initiator CPU N — see tlb_shootdown_wrapper0..7 in isr.asm).
+ * @param src_cpu The initiating CPU's cpu_id, baked into the calling wrapper.
  *
- * Executes invlpg(g_tlb_barrier.virt), then calls ipi_barrier_ack(&g_tlb_barrier)
- * (decrement-before-EOI guarantees the initiator sees ack_count==0 only after
- * the TLB flush is complete), then calls lapic_eoi_asm().
+ * Executes invlpg(g_tlb_barriers[src_cpu].virt), then calls
+ * ipi_barrier_ack(&g_tlb_barriers[src_cpu]) (decrement-before-EOI guarantees
+ * the initiator sees ack_count==0 only after the TLB flush is complete),
+ * then calls lapic_eoi_asm().
  */
-void tlb_shootdown_isr(void *frame);
+void tlb_shootdown_isr(uint32_t src_cpu);
 
 /**
  * @brief Broadcast halt IPI to all APs on kernel panic.

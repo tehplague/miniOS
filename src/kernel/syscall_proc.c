@@ -202,8 +202,7 @@ int64_t syscall_dispatch_proc(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_
 
     switch (nr) {
     case SYS_fork: {
-        struct thread *child = sched_fork();
-        child->saved_user_rdi = arg1;
+        struct thread *child = sched_fork(arg1);
         return (int64_t)child->tid;
     }
 
@@ -839,8 +838,7 @@ int64_t syscall_dispatch_proc(uint64_t nr, uint64_t arg1, uint64_t arg2, uint64_
         return (int64_t)clone_child->tid;  /* parent gets child TID; child gets 0 */
 
       do_fork:;
-        struct thread *fork_child = sched_fork();
-        fork_child->saved_user_rdi = arg1;
+        struct thread *fork_child = sched_fork(arg1);
         return (int64_t)fork_child->tid;
     }
 

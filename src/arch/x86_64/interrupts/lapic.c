@@ -32,10 +32,12 @@
 #include <miniOS/drivers/vt.h>
 #endif
 
-/* Calibration comment preserved for reference:
-   PIT channel 2 OUT bit polling was removed because port 0x61 bit 5 does
-   not toggle reliably under QEMU/KVM.  Calibration now uses a 10ms busy-loop
-   via outb(0x80) × 10000 (each ≈ 1 µs, no KVM PAUSE_FILTER overhead). */
+/* Both the LAPIC timer ICR and miniOS_tsc_hz are calibrated against PIT
+   channel 2's OUT bit (port 0x61 bit 5) — see lapic_timer_init(). An earlier
+   version of this file removed PIT polling here, believing bit 5 didn't
+   toggle reliably under QEMU/KVM, and used an assumed-rate busy-loop
+   instead; that assumption was itself the bug (see lapic_timer_init()'s
+   comment) — the PIT read has been reliable in testing since. */
 
 volatile uint32_t *lapic_base = NULL;
 
@@ -94,11 +96,30 @@ void lapic_init(void) {
     idt_set_handler(SCHEDULER_KICK_VECTOR, (addr_t)sched_kick_wrapper,
                     KERN_PRIVILEGE_LEVEL, IDT_INTERRUPT_GATE);
 
-    /* Register TLB-shootdown IPI handler (used by ipi_tlb_shootdown to flush
-       remote CPU TLB entries after sys_munmap unmaps a page). */
-    extern void tlb_shootdown_wrapper(void);
-    idt_set_handler(TLB_SHOOTDOWN_VECTOR, (addr_t)tlb_shootdown_wrapper,
-                    KERN_PRIVILEGE_LEVEL, IDT_INTERRUPT_GATE);
+    /* Register the 8 TLB-shootdown IPI handlers — one per possible initiator
+       CPU (TLB_SHOOTDOWN_VECTOR_BASE + cpu_id; see ipi.h for why each
+       initiator needs its own vector). Used by ipi_tlb_shootdown() to flush
+       remote CPU TLB entries after a CoW fault, mmap/munmap/mprotect, or a
+       fork's CoW page-sharing. */
+    extern void tlb_shootdown_wrapper0(void);
+    extern void tlb_shootdown_wrapper1(void);
+    extern void tlb_shootdown_wrapper2(void);
+    extern void tlb_shootdown_wrapper3(void);
+    extern void tlb_shootdown_wrapper4(void);
+    extern void tlb_shootdown_wrapper5(void);
+    extern void tlb_shootdown_wrapper6(void);
+    extern void tlb_shootdown_wrapper7(void);
+    void (*tlb_wrappers[8])(void) = {
+        tlb_shootdown_wrapper0, tlb_shootdown_wrapper1,
+        tlb_shootdown_wrapper2, tlb_shootdown_wrapper3,
+        tlb_shootdown_wrapper4, tlb_shootdown_wrapper5,
+        tlb_shootdown_wrapper6, tlb_shootdown_wrapper7,
+    };
+    for (int i = 0; i < 8; i++) {
+        idt_set_handler((uint8_t)(TLB_SHOOTDOWN_VECTOR_BASE + i),
+                        (addr_t)tlb_wrappers[i],
+                        KERN_PRIVILEGE_LEVEL, IDT_INTERRUPT_GATE);
+    }
 
     /* Register panic-halt IPI handler (used by ipi_panic_halt to stop all APs
        when a kernel exception occurs on any CPU). */
@@ -164,57 +185,34 @@ void lapic_timer_idt_install(void) {
 }
 
 void lapic_timer_init(void) {
-    /* Calibrate LAPIC timer ticks per 10ms using a port-0x80 busy-loop.
+    /* Calibrate LAPIC timer ticks per 10ms against the PIT (8254) channel 2,
+       a real crystal-referenced clock (1,193,182 Hz), instead of a fixed-
+       iteration-count busy-loop that merely assumes some effective rate
+       (previously ~1 GHz). That assumption doesn't hold under every
+       host/virtualization environment: when the busy-loop actually takes
+       longer than the assumed 10ms in real time, the resulting ICR comes out
+       too large, so the "10ms" periodic timer it configures actually fires
+       far slower than 100Hz — every ITIMER_REAL consumer (alarm(2)/
+       setitimer(2), e.g. busybox ping's -i interval pacing) then runs at
+       whatever the real (wrong) period is instead of the requested one.
+       The PIT measurement below was already being done, just to calibrate
+       miniOS_tsc_hz — reuse that same accurate 10ms window for the LAPIC
+       ICR too, instead of running a second, unreliable one.
        IDT entry for LAPIC_TIMER_VECTOR is already installed by
-       lapic_timer_idt_install() (called before smp_boot_aps()).
-
-       Divide-by-16 (DCR=0x3): on QEMU TCG the bus clock is ~1 GHz,
-       so the effective rate is ~62.5 MHz, giving ~625 000 ticks per 10ms. */
+       lapic_timer_idt_install() (called before smp_boot_aps()). */
 
     /* Step 1: set LAPIC timer divisor, mask LVT, load max initial count */
     lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIVBY_16);
     lapic_write(LAPIC_TIMER_LVT, LAPIC_TIMER_MASKED | LAPIC_TIMER_VECTOR);
     lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
 
-    /* Step 3: wait 10ms using a plain decrement loop.
-       'outb(0x80)' was replaced because when APs' LAPIC timers are running
-       their VM exits contend with BSP's outb exits, making the loop take
-       much longer than intended.  A plain decrement runs entirely in-guest.
-       10 million iterations at ~1 GHz KVM effective rate ≈ 10ms.
-
-       We also use this loop to calibrate the TSC frequency: read TSC before
-       and after the 10ms busy-loop, then scale to Hz.  This piggybacks on the
-       LAPIC calibration delay so we only spin once. */
-    uint64_t tsc_start = lapic_rdtsc();
-    for (volatile uint32_t i = 10000000U; i > 0; i--) {
-        __asm__ volatile("" ::: "memory");
-    }
-    uint64_t tsc_end = lapic_rdtsc();
-
-    /* Step 4: read LAPIC current count and compute ticks per 10ms */
-    uint32_t lapic_ccr = lapic_read(LAPIC_TIMER_CCR);
-    uint32_t ticks_per_10ms = 0xFFFFFFFF - lapic_ccr;
-
-    /* Step 5: ticks_per_10ms IS the ICR for 100 Hz (one tick every 10ms) */
-    /* WR-05: sanity-floor for suspiciously low calibration results (e.g. the
-     * busy-loop ran faster than expected and the LAPIC count barely moved).
-     * 10 000 ticks at div/16 corresponds to <1ms of actual measurement — too
-     * short to be reliable.  Fall back to 625 000 (62.5 MHz / 100 Hz). */
-    if (ticks_per_10ms < 10000)
-        ticks_per_10ms = 625000;
-    uint32_t icr = ticks_per_10ms;
-    if (icr == 0) icr = 1000000; /* fallback if measurement unavailable */
-
-    /* Step 6: save calibrated ICR for APs (they reuse this value) */
-    lapic_bsp_timer_icr = icr;
-
-    /* Step 7: TSC calibration — compute Hz from the 10ms busy-loop window.
-       tsc_end - tsc_start is the number of TSC ticks in ~10ms; multiply by 100
-       to get Hz.  If the measurement is invalid, use a 2 GHz conservative
-       estimate (D-09: miniOS_tsc_hz must never be zero). */
-    /* PIT ch2 TSC calibration: 1,193,182 Hz crystal → 11,932 ticks ≈ 10 ms.
-       Accurate regardless of QEMU/KVM mode or CPU speed, unlike the busy-loop. */
+    /* Step 2: PIT ch2 gate — 1,193,182 Hz crystal → 11,932 ticks ≈ 10 ms.
+       Accurate regardless of QEMU/KVM mode, host load, or CPU speed, unlike
+       a busy-loop. Read the LAPIC's own free-running down-counter and the
+       TSC immediately before/after this same accurately-timed window, so
+       both calibrations share one real 10ms measurement. */
     int tsc_fallback = 0;
+    uint32_t ticks_per_10ms;
     {
         uint8_t pit_save = inb(0x61);
         outb(0x61, (pit_save & ~0x02) | 0x01);  /* gate2=1, speaker off */
@@ -223,14 +221,17 @@ void lapic_timer_init(void) {
         outb(0x42, 0x2e);                        /* count=11932 high byte → starts */
         uint64_t pit_tsc0 = lapic_rdtsc();
         while ((inb(0x61) & 0x20) == 0) {}      /* spin until OUT2 high (count expired) */
+        uint32_t lapic_ccr = lapic_read(LAPIC_TIMER_CCR);
         uint64_t pit_tsc1 = lapic_rdtsc();
         outb(0x61, pit_save);
+
+        ticks_per_10ms = 0xFFFFFFFF - lapic_ccr;
 
         if (pit_tsc1 > pit_tsc0) {
             miniOS_tsc_boot = pit_tsc0;
             miniOS_tsc_hz   = (pit_tsc1 - pit_tsc0) * 100ULL;
         } else {
-            miniOS_tsc_boot = tsc_start;
+            miniOS_tsc_boot = pit_tsc0;
             miniOS_tsc_hz   = 2000000000ULL;
             tsc_fallback    = 1;
         }
@@ -240,7 +241,20 @@ void lapic_timer_init(void) {
         tsc_fallback  = 1;
     }
 
-    /* Step 8: start periodic timer */
+    /* Step 3: ticks_per_10ms IS the ICR for 100 Hz (one tick every 10ms) */
+    /* WR-05: sanity-floor for suspiciously low calibration results (e.g. the
+     * PIT gate glitched and the LAPIC count barely moved).
+     * 10 000 ticks at div/16 corresponds to <1ms of actual measurement — too
+     * short to be reliable.  Fall back to 625 000 (62.5 MHz / 100 Hz). */
+    if (ticks_per_10ms < 10000)
+        ticks_per_10ms = 625000;
+    uint32_t icr = ticks_per_10ms;
+    if (icr == 0) icr = 1000000; /* fallback if measurement unavailable */
+
+    /* Step 4: save calibrated ICR for APs (they reuse this value) */
+    lapic_bsp_timer_icr = icr;
+
+    /* Step 5: start periodic timer */
     lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIVBY_16);
     lapic_write(LAPIC_TIMER_LVT, LAPIC_TIMER_PERIODIC | LAPIC_TIMER_VECTOR);
     lapic_write(LAPIC_TIMER_ICR, icr);
@@ -283,6 +297,16 @@ void lapic_timer_init_ap(void) {
  */
 void lapic_send_ipi(uint8_t target_lapic_id, uint8_t vector)
 {
+    /* Wait for any previous IPI send from this CPU to finish (ICR_LOW bit 12
+     * = Delivery Status, 1 while a send is still pending). Skipping this on
+     * real xAPIC hardware risks the new ICR write clobbering/dropping the
+     * previous send — callers here (ipi_tlb_shootdown in particular) can
+     * issue many lapic_send_ipi() calls back-to-back within one syscall
+     * (one CoW fork can trigger dozens of shootdowns), so this is not just
+     * a theoretical hazard. */
+    while (lapic_read(LAPIC_ICR_LOW) & (1U << 12))
+        __asm__ volatile("pause" : : : "memory");
+
     /* Write destination first; ICR_HIGH must be set before ICR_LOW. */
     lapic_write(LAPIC_ICR_HIGH, ((uint32_t)target_lapic_id) << 24);
 

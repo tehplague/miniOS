@@ -55,13 +55,14 @@ int stub_sched_exit_called = 0;  /* tests can inspect this flag */
 int stub_sched_wait_exit_code = 0;  /* tests set this to control returned exit_code */
 int stub_sched_wait_retval    = 0;  /* tests set to -1 to simulate wait failure */
 
-struct thread *sched_fork(void) {
+struct thread *sched_fork(uint64_t child_rdi) {
     fork_child_thread = test_thread;
     fork_child_thread.tid  = 99;
     fork_child_thread.pid  = 99;                /* stub child PID = TID */
     fork_child_thread.ppid = test_thread.pid;   /* parent is test_thread */
     fork_child_thread.pgid = test_thread.pgid;  /* inherit group */
     fork_child_thread.sid  = test_thread.sid;   /* inherit session */
+    fork_child_thread.saved_user_rdi = child_rdi;
     return &fork_child_thread;
 }
 
@@ -136,4 +137,14 @@ void sched_stop_current(int stop_signal) {
     struct thread *cur = sched_current();
     cur->state = THREAD_STOPPED;
     cur->stop_signal = (uint8_t)stop_signal;
+}
+
+/* sched_ptrace_stop: same host-test caveat as sched_stop_current above —
+ * records the state transition without actually blocking (sched_yield is a
+ * no-op stub), since no current test exercises PTRACE_CONT resuming it. */
+void sched_ptrace_stop(int reason) {
+    struct thread *cur = sched_current();
+    cur->state = THREAD_STOPPED;
+    cur->stop_signal = SIGTRAP;
+    cur->ptrace_stop_reason = (uint8_t)reason;
 }

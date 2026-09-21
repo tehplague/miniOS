@@ -106,12 +106,37 @@ it calls `sched_work_steal()` which:
 
 Two IPI channels are implemented (both using `lapic_send_ipi()`):
 
-### TLB Shootdown (vector 51)
+### TLB Shootdown (vectors 53-60, one per initiator CPU)
 
-When `sys_munmap` unmaps a page, `ipi_tlb_shootdown(virt)` broadcasts to all
-other CPUs. Each CPU's `tlb_shootdown_isr` executes `invlpg(g_tlb_barrier.virt)`,
-then calls `ipi_barrier_ack()` (decrement-before-EOI guarantee), then sends EOI.
-The initiator blocks in `ipi_barrier_wait()` until `g_tlb_barrier.ack_count == 0`.
+`ipi_tlb_shootdown(virt)` is called whenever a PTE changes on a mapping that
+might be live on another CPU — `sys_munmap`, `mmap`/`mprotect` remapping a
+page, and fork's CoW page-sharing (`fork_cow_share_page`) and CoW-fault
+resolution (`vmm_resolve_user_fault`) all go through it.
+
+Each CPU has its own barrier slot (`g_tlb_barriers[cpu_id]`) and its own IPI
+vector (`TLB_SHOOTDOWN_VECTOR_BASE + cpu_id`, 8 vectors for `MAX_CPUS=8`), so
+two CPUs can initiate a shootdown at the same moment without touching each
+other's state — a single shared barrier previously let concurrent initiators
+clobber each other's `virt`/`ack_count`, corrupting `ack_count` past zero
+(wraps, since it's unsigned) and hanging `ipi_barrier_wait()` forever. The
+initiator sets its own slot's `ack_count = smp_cpu_count - 1`, broadcasts its
+vector, and blocks in `ipi_barrier_wait()`; each target's `tlb_shootdown_isr`
+executes `invlpg(g_tlb_barriers[src_cpu].virt)`, then `ipi_barrier_ack()`
+(decrement-before-EOI guarantee), then sends EOI.
+
+`vmm_resolve_user_fault()` (a CoW page fault) can call this with interrupts
+disabled (`#PF` is an interrupt gate, IF=0 for the whole handler) — this is
+safe: an initiator never waits on itself, only on other CPUs, so it needs no
+incoming interrupts to make progress. The only cost is that a peer CPU whose
+shootdown targets a CPU currently inside a `#PF` (or any other IF=0 section)
+has to wait for that section to finish and return before its IPI is
+serviced — bounded, since none of these sections block. An earlier attempt
+to shrink that wait by re-enabling interrupts inside `page_fault_exception()`
+was reverted: it let a LAPIC timer tick preempt mid-handler, and resuming
+from that nested preemption corrupted kernel `.text` mappings (instruction
+fetch `#PF`s on kernel code, cascading to a CPU reset) — the exception
+return path isn't proven safe against being preempted from inside exception
+context.
 
 ### Panic Halt (vector 52)
 

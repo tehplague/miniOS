@@ -51,7 +51,7 @@ void idt_set_handler(uint8_t vec, addr_t addr, unsigned int dpl, uint8_t gate_ty
 /* Stub ipi_tlb_shootdown: syscall.c calls this after vmm_unmap_page on SMP.
  * In host unit tests, no real LAPIC or SMP is present — stub is a no-op. */
 #include <miniOS/ipi/ipi.h>
-ipi_barrier_t g_tlb_barrier = { .ack_count = 0, .virt = 0 };
+ipi_barrier_t g_tlb_barriers[MAX_CPUS];
 void ipi_tlb_shootdown(uint64_t virt) { (void)virt; }
 
 /* Stub for cpu_local(): syscall.c calls this for SYS_sched_getcpu.

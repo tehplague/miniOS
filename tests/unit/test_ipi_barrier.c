@@ -78,10 +78,10 @@ void test_barrier_ack_to_zero(void)
 
 /* ── Vector constant tests ── */
 
-/** TLB_SHOOTDOWN_VECTOR must be 51. */
+/** TLB_SHOOTDOWN_VECTOR_BASE must be 53 (vectors 53..60 cover cpu_id 0..7). */
 void test_tlb_vector_value(void)
 {
-    TEST_ASSERT_EQUAL_UINT32(51, TLB_SHOOTDOWN_VECTOR);
+    TEST_ASSERT_EQUAL_UINT32(53, TLB_SHOOTDOWN_VECTOR_BASE);
 }
 
 /** PANIC_HALT_VECTOR must be 52. */
@@ -92,19 +92,20 @@ void test_panic_vector_value(void)
 
 /* ── ICR encoding tests ── */
 
-/** ICR_HIGH[31:24] must equal target_lapic_id after send_ipi_sim(3, TLB_SHOOTDOWN_VECTOR). */
+/** ICR_HIGH[31:24] must equal target_lapic_id after send_ipi_sim(3, TLB_SHOOTDOWN_VECTOR_BASE). */
 void test_tlb_ipi_icr_encoding_dest(void)
 {
-    send_ipi_sim(3, TLB_SHOOTDOWN_VECTOR);
+    send_ipi_sim(3, TLB_SHOOTDOWN_VECTOR_BASE);
     TEST_ASSERT_EQUAL_UINT32(3U, fake_lapic[LAPIC_ICR_HIGH / 4] >> 24);
 }
 
-/** ICR_LOW[7:0] must equal 51 (TLB_SHOOTDOWN_VECTOR) after send_ipi_sim(1, TLB_SHOOTDOWN_VECTOR). */
+/** ICR_LOW[7:0] must equal the per-initiator vector (BASE + cpu_id) after
+ * send_ipi_sim(1, TLB_SHOOTDOWN_VECTOR_BASE + 2) — simulating CPU 2 as initiator. */
 void test_tlb_ipi_icr_encoding_vector(void)
 {
-    send_ipi_sim(1, TLB_SHOOTDOWN_VECTOR);
-    TEST_ASSERT_EQUAL_UINT32(TLB_SHOOTDOWN_VECTOR,
-                             fake_lapic[LAPIC_ICR_LOW / 4] & 0xFF);
+    uint8_t vector = TLB_SHOOTDOWN_VECTOR_BASE + 2;
+    send_ipi_sim(1, vector);
+    TEST_ASSERT_EQUAL_UINT32(vector, fake_lapic[LAPIC_ICR_LOW / 4] & 0xFF);
 }
 
 int main(void)

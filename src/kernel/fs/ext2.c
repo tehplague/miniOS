@@ -494,15 +494,16 @@ static int inode_data_block(const ext2_inode_t *inode, uint32_t block_idx,
  * Single block group assumed (8 MiB image has exactly one group).
  *
  * @return: 0 on success, -1 on ATA I/O error or invalid magic.
+ *
+ * Validates the superblock (magic + size-vs-partition sanity) using the
+ * caller-supplied range before touching any global state, so a failed call
+ * never corrupts an already-mounted instance's g_part_start/g_part_end.
  */
 int ext2_mount(uint64_t part_lba_start, uint64_t part_lba_end)
 {
-    g_part_start = part_lba_start;
-    g_part_end = part_lba_end;
-
     /* Superblock is at byte 1024 from partition start.
      * With 512-byte sectors: LBA offset = 2 sectors into the partition. */
-    if (block_read(g_part_start + 2, 2, g_block_buf) != 0) {
+    if (block_read(part_lba_start + 2, 2, g_block_buf) != 0) {
         printk("EXT2: I/O error reading superblock\n");
         return -1;
     }
@@ -515,23 +516,29 @@ int ext2_mount(uint64_t part_lba_start, uint64_t part_lba_end)
         return -1;
     }
 
-    g_block_size        = 1024u << sb->s_log_block_size;
-    g_sectors_per_block = g_block_size / 512;
+    uint32_t block_size        = 1024u << sb->s_log_block_size;
+    uint32_t sectors_per_block = block_size / 512;
+
+    /* Sanity check: filesystem size vs partition size */
+    uint64_t fs_blocks = sb->s_blocks_count;
+    uint64_t fs_sectors = fs_blocks * sectors_per_block;
+    if (part_lba_start + fs_sectors - 1 > part_lba_end) {
+        printk("EXT2: filesystem size (%lu sectors) exceeds partition boundary (%lu)\n",
+               fs_sectors, part_lba_end - part_lba_start + 1);
+        return -1;
+    }
+
+    /* Validated — safe to commit to global state. */
+    g_part_start        = part_lba_start;
+    g_part_end          = part_lba_end;
+    g_block_size        = block_size;
+    g_sectors_per_block = sectors_per_block;
     g_inodes_per_group  = sb->s_inodes_per_group;
     g_blocks_per_group  = sb->s_blocks_per_group;
     g_inode_size        = (sb->s_rev_level >= 1) ? sb->s_inode_size : 128;
     g_first_data_block  = sb->s_first_data_block;
     g_sb_blocks_count   = sb->s_blocks_count;
     g_sb_inodes_count   = sb->s_inodes_count;
-
-    /* Sanity check: filesystem size vs partition size */
-    uint64_t fs_blocks = sb->s_blocks_count;
-    uint64_t fs_sectors = fs_blocks * g_sectors_per_block;
-    if (g_part_start + fs_sectors - 1 > g_part_end) {
-        printk("EXT2: filesystem size (%lu sectors) exceeds partition boundary (%lu)\n",
-               fs_sectors, g_part_end - g_part_start + 1);
-        return -1;
-    }
 
     printk("EXT2: mounted, block_size=%u, inodes=%u\n",
            g_block_size, sb->s_inodes_count);
@@ -1964,6 +1971,15 @@ static int ext2_statfs(vfs_statfs_t *out)
     return 0;
 }
 
+/* ext2 keeps a single global instance (g_part_start/g_block_size/etc. — see
+ * "Module state" above), so only one ext2 mount may be active at a time.
+ * Set once vfs_register_mount() succeeds; cleared by ext2_do_unmount(). */
+static int g_ext2_mounted = 0;
+
+static void ext2_do_unmount(void) {
+    g_ext2_mounted = 0;
+}
+
 static vfs_ops_t g_ext2_vfs_ops = {
     .lookup   = ext2_lookup,
     .read     = ext2_read_file,
@@ -1981,11 +1997,17 @@ static vfs_ops_t g_ext2_vfs_ops = {
     .mknod    = ext2_mknod,
     .chmod    = ext2_chmod,
     .statfs   = ext2_statfs,
+    .unmount  = ext2_do_unmount,
 };
 
 static int ext2_fs_mount(const char *source, const char *target, const void *data)
 {
     (void)source;
+    if (g_ext2_mounted) {
+        printk("EXT2: already mounted elsewhere (single-instance filesystem); "
+               "unmount it first\n");
+        return -16;  /* EBUSY */
+    }
     if (!data) {
         printk("EXT2: mount called without vfs_mount_data_t\n");
         return -22;  /* EINVAL */
@@ -1998,7 +2020,9 @@ static int ext2_fs_mount(const char *source, const char *target, const void *dat
     }
     if (ext2_mount(blkdev->lba_start, blkdev->lba_end) != 0)
         return -1;
-    return vfs_register_mount(target, &g_ext2_vfs_ops, 0);
+    int rc = vfs_register_mount(target, &g_ext2_vfs_ops, 0);
+    if (rc == 0) g_ext2_mounted = 1;
+    return rc;
 }
 
 void ext2_init(void)

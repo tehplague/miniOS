@@ -25,8 +25,9 @@
 #include <miniOS/arch/x86_64/smp.h>
 #include <miniOS/io.h>
 
-/* Global TLB barrier — initiator writes virt+ack_count; ISR reads virt, decrements ack_count */
-ipi_barrier_t g_tlb_barrier = { .ack_count = 0, .virt = 0 };
+/* One barrier per possible initiator CPU — see the comment on
+ * g_tlb_barriers[] in ipi.h for why a single shared barrier isn't safe. */
+ipi_barrier_t g_tlb_barriers[MAX_CPUS];
 
 void ipi_tlb_shootdown(uint64_t virt)
 {
@@ -35,33 +36,38 @@ void ipi_tlb_shootdown(uint64_t virt)
         return;
 
     cpu_t *local = cpu_local();
+    ipi_barrier_t *barrier = &g_tlb_barriers[local->cpu_id];
 
-    /* Set up barrier: all CPUs except self must acknowledge */
-    g_tlb_barrier.virt      = virt;
+    /* Set up this CPU's own barrier slot: all other CPUs must acknowledge.
+     * No other CPU ever writes g_tlb_barriers[local->cpu_id], so this needs
+     * no lock even when other CPUs are concurrently doing their own
+     * shootdowns via their own slots. */
+    barrier->virt = virt;
     /* Compiler barrier ensures virt is visible before ack_count is set */
     __asm__ volatile("" : : : "memory");
-    g_tlb_barrier.ack_count = smp_cpu_count - 1;
+    barrier->ack_count = smp_cpu_count - 1;
     /* Compiler barrier ensures ack_count is visible before IPIs are sent */
     __asm__ volatile("" : : : "memory");
 
-    /* Broadcast to all other CPUs */
+    /* Broadcast to all other CPUs on this initiator's dedicated vector */
+    uint8_t vector = (uint8_t)(TLB_SHOOTDOWN_VECTOR_BASE + local->cpu_id);
     for (uint32_t i = 0; i < smp_cpu_count; i++) {
         if (g_cpus[i].cpu_id != local->cpu_id)
-            lapic_send_ipi(g_cpus[i].lapic_id, TLB_SHOOTDOWN_VECTOR);
+            lapic_send_ipi(g_cpus[i].lapic_id, vector);
     }
 
     /* Spin until all handlers have acknowledged */
-    ipi_barrier_wait(&g_tlb_barrier);
+    ipi_barrier_wait(barrier);
 }
 
-void tlb_shootdown_isr(void *frame)
+void tlb_shootdown_isr(uint32_t src_cpu)
 {
-    (void)frame;
-    /* Flush the remote CPU's TLB entry for the address set by initiator */
-    uint64_t virt = g_tlb_barrier.virt;
+    /* Flush this CPU's TLB entry for the address set by initiator src_cpu */
+    ipi_barrier_t *barrier = &g_tlb_barriers[src_cpu];
+    uint64_t virt = barrier->virt;
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
     /* Decrement barrier BEFORE sending EOI — ordering is critical */
-    ipi_barrier_ack(&g_tlb_barrier);
+    ipi_barrier_ack(barrier);
     lapic_eoi_asm();
 }
 
